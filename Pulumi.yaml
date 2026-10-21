@@ -1,0 +1,10 @@
+name: guestbook-monitoring
+runtime: nodejs
+description: Kubernetes Guestbook with Prometheus and Grafana monitoring
+config:
+  isMinikube:
+    type: boolean
+    default: false
+  grafanaServiceType:
+    type: string
+    default: ""
