@@ -1,227 +1,121 @@
 # Guestbook with Prometheus and Grafana
 
-Deployment of Pulumi Guestbook app on Kubernetes and monitor what is happening inside the cluster.
+This is the Pulumi Kubernetes Guestbook example with monitoring added. Everything runs on a local kind cluster and is deployed with a single `pulumi up`.
 
-Things added:
+What gets deployed:
 
-- **Prometheus and Grafana:** Installed using the `kube-prometheus-stack` Helm chart.
-- **Redis monitoring:** Added `redis_exporter` to both redis_leader and redis_replica as sidecar running on port `9121`.
-- **Frontend monitoring:** Enabled Apache `mod_status` and added an `apache_exporter` sidecar on port `9117`.
-- **Prometheus scraping:** The `ServiceMonitor` tells Prometheus where to collect metrics from the Guestbook services.
-- **Grafana dashboard:** The `Guestbook Overview` dashboard is loaded automatically and it shows request rate, Redis commands, pod CPU and memory, ready pods, and restarts.
-- **Grafana access:** Grafana uses a NodePort on local kind clusters and a LoadBalancer on cloud clusters.
+- The Guestbook app (frontend + Redis leader/replica)
+- MetalLB, so `LoadBalancer` services get a real IP on kind
+- Prometheus and Grafana from the `kube-prometheus-stack` Helm chart
+- An apache exporter sidecar on the frontend and a redis exporter sidecar on both Redis pods
+- A `ServiceMonitor` so Prometheus scrapes those exporters
+- A "Guestbook Overview" dashboard in Grafana
+- A small traffic generator pod so there is data to look at straight away
 
-## Requirements
+## Prerequisites
 
-You need to install the following:
-
-- Docker Desktop
-- [kind](https://kind.sigs.k8s.io/)
+- Docker
+- kind
 - kubectl
-- Node.js 18+
-- [Pulumi CLI](https://www.pulumi.com/docs/install/)
+- Node.js 18 or newer
+- Pulumi CLI
 
-## Setup
+## Deploy
 
-### 1. Create the Kubernetes cluster
-
-I'm using kind for the local setup.
+Create the cluster:
 
 ```bash
-kind create cluster --name guestbook
-kubectl cluster-info --context kind-guestbook
+kind create cluster --config kind-config.yaml
 ```
 
-### 2. Install dependencies
-
-From the project directory, run:
+Install the dependencies and set up a local Pulumi stack:
 
 ```bash
 npm install
-```
-
-### 3. Configure Pulumi
-
-First, set a passphrase for your local Pulumi secrets and log in locally.
-
-```bash
-export PULUMI_CONFIG_PASSPHRASE="choose-a-passphrase"
+export PULUMI_CONFIG_PASSPHRASE=guestbook
 pulumi login --local
 pulumi stack init dev
 ```
 
-Since kind doesn't come with a cloud LoadBalancer, set these two options:
+On Windows PowerShell use `$env:PULUMI_CONFIG_PASSPHRASE="guestbook"` instead of `export`.
+
+Deploy:
 
 ```bash
-pulumi config set isMinikube true
-pulumi config set trafficGenerator true
+pulumi up --yes
 ```
 
-`isMinikube` configures the frontend as a ClusterIP service and Grafana as a NodePort service.
-
-`trafficGenerator` deploys a small pod that sends requests to the frontend. This gives us some traffic to work with when checking the dashboard.
-
-**If you're using a cloud cluster** like EKS, GKE, or AKS, skip those two configuration commands. The frontend and Grafana will use LoadBalancer services instead.
-
-### 4. Deploy the application
+The first run takes around 5 to 8 minutes, mostly pulling images. When it finishes, print the outputs:
 
 ```bash
-pulumi up
+pulumi stack output
 ```
 
-Review the changes and select `yes` to continue.
+## Access
 
-The first deployment will take about 5 minutes.
+Grafana: http://localhost:30300
 
-### 5. Check that the pods are running
+- Username: `admin`
+- Password: `guestbook123`
 
-```bash
-kubectl -n guestbook get pods
-kubectl -n monitoring get pods
+Guestbook: http://localhost:30080
+
+Prometheus: http://localhost:30090
+
+These localhost links work on Linux, macOS and Windows. kind forwards them to the same LoadBalancer services.
+
+The services also get their own MetalLB IPs, which are in the `grafanaUrl`, `guestbookUrl` and `prometheusUrl` outputs. On Linux you can open those directly. On macOS and Windows, Docker runs inside a VM, so those IPs can't be reached from the host. Use the localhost links there.
+
+To use a different Grafana password, run `pulumi config set grafanaAdminPassword <password>` before `pulumi up`.
+
+## Check that Prometheus is scraping the Guestbook
+
+Open http://localhost:30090/targets and type `guestbook` in the filter. You should see `serviceMonitor/guestbook/guestbook/0` with 5 targets, all UP:
+
+- 3 with `job="frontend-metrics"`, one per frontend pod
+- 1 with `job="redis-leader-metrics"`
+- 1 with `job="redis-replica-metrics"`
+
+You can also run these queries on http://localhost:30090/graph:
+
+```promql
+up{namespace="guestbook"}
+sum(rate(apache_accesses_total{namespace="guestbook"}[2m]))
+sum by (app) (rate(redis_commands_processed_total{namespace="guestbook"}[2m]))
+sum by (pod) (rate(container_cpu_usage_seconds_total{namespace="guestbook", container!=""}[2m]))
 ```
 
-The frontend and Redis pods should show `2/2` in the READY column. One container runs the application, and the other runs its exporter.
-
-### 6. Open the Guestbook
-
-Forward the frontend service to your local machine:
-
-```bash
-kubectl -n guestbook port-forward svc/frontend 8080:80
-```
-
-Open [http://localhost:8080](http://localhost:8080) in your browser.
-
-## Grafana
-
-### Access Grafana
-
-Get the connection details from Pulumi:
-
-```bash
-pulumi stack output grafanaUrl
-pulumi stack output grafanaAdminUser
-pulumi stack output grafanaAdminPassword --show-secrets
-```
-
-The default username is `admin`. The password is generated during deployment and stored as a Pulumi secret.
-
-If you want to set your own password, do this before running `pulumi up`:
-
-```bash
-pulumi config set --secret grafanaAdminPassword <password>
-```
-
-### Open Grafana on kind
-
-Since kind doesn't provide a LoadBalancer, forward the Grafana service to your machine:
-
-```bash
-kubectl -n monitoring port-forward svc/kps-grafana 3000:80
-```
-
-Open [http://localhost:3000](http://localhost:3000) and log in.
-
-Go to **Dashboards → Guestbook → Guestbook Overview**.
-
-You should see the metrics collected from the Guestbook application.
-
-If you're using a cloud cluster, check the `grafanaUrl` output and open the LoadBalancer address directly.
-
-## Verify Prometheus is collecting metrics
-
-Let's check that Prometheus can actually see the Guestbook metrics.
-
-### 1. Check the ServiceMonitor and metrics services
+From the command line:
 
 ```bash
 kubectl -n guestbook get servicemonitor
 kubectl -n guestbook get svc -l monitoring.guestbook/scrape=true
 ```
 
-These should show the ServiceMonitor and the services exposing application metrics.
+## Grafana dashboard
 
-### 2. Check Prometheus targets
+In Grafana, go to Dashboards > Guestbook > Guestbook Overview. It shows the frontend request rate, Redis commands, connected clients and memory, plus CPU, memory, ready pods and restarts for the guestbook pods. Give it a minute or two after the deploy for the graphs to fill in.
 
-Forward the Prometheus service:
+## Project layout
 
-```bash
-kubectl -n monitoring port-forward svc/prometheus-operated 9090:9090
-```
-
-Open [http://localhost:9090/targets](http://localhost:9090/targets) and search for `guestbook`.
-
-You should see 5 targets in the UP state:
-
-- 3 frontend pods
-- 1 Redis leader
-- 1 Redis replica
-
-### 3. Try some Prometheus queries
-
-Open the Prometheus Graph page and run these queries.
-
-Check which targets are up:
-
-```promql
-up{namespace="guestbook"}
-```
-
-Check the frontend request rate:
-
-```promql
-sum(rate(apache_accesses_total{namespace="guestbook"}[2m]))
-```
-
-Check Redis command rates:
-
-```promql
-sum by (app) (rate(redis_commands_processed_total{namespace="guestbook"}[2m]))
-```
-
-Check CPU usage by pod:
-
-```promql
-sum by (pod) (rate(container_cpu_usage_seconds_total{namespace="guestbook", container!=""}[2m]))
-```
-
-If the traffic generator is enabled, you should have traffic to work with when testing these queries.
-
-### 4. Check an exporter directly (optional)
-
-You can also query the frontend exporter from inside the cluster:
-
-```bash
-kubectl -n guestbook run curl --rm -it \
-  --restart=Never \
-  --image=curlimages/curl -- \
-  curl -s frontend-metrics:9117/metrics | grep apache_accesses_total
-```
-
-This is useful when you want to check whether the exporter is exposing metrics before troubleshooting Prometheus.
-
-## Project structure
-
-| File | What it does |
-|---|---|
-| `index.ts` | Reads the configuration, creates the two components, and exports the outputs. |
-| `monitoring.ts` | Deploys `kube-prometheus-stack`, configures the Grafana service, and creates the dashboard ConfigMap. |
-| `guestbook.ts` | Creates the Guestbook deployments and services, exporter sidecars, metrics services, and ServiceMonitor. |
-| `grafana/guestbook-dashboard.json` | Contains the Grafana dashboard definition. |
+- `index.ts`: config and stack outputs
+- `metallb.ts`: installs MetalLB and creates an IP pool from the kind docker network
+- `monitoring.ts`: kube-prometheus-stack, the Grafana and Prometheus LoadBalancer services, and the dashboard ConfigMap
+- `guestbook.ts`: the Guestbook app, the exporters, the metrics services and the ServiceMonitor
+- `grafana/guestbook-dashboard.json`: the dashboard
+- `kind-config.yaml`: the kind cluster with the localhost port mappings
 
 ## Notes
 
-- The Guestbook app doesn't expose HTTP status codes as metrics, so the dashboard uses container restarts instead of an HTTP error rate.
-- Other configuration options include `grafanaServiceType`, `grafanaNodePort`, `grafanaAdminUser`, `frontendReplicas`, and `kubePrometheusStackVersion`.
+- The Guestbook app doesn't expose HTTP status codes, so the dashboard shows container restarts instead of an error rate.
+- The apache request count includes the exporter's own requests to `/server-status` (one per pod every 15s).
+- MetalLB picks its addresses from the top of the `kind` docker network, for example `172.18.255.200-172.18.255.250`. You can override this with `pulumi config set metallbAddressRange <start>-<end>`.
+- On a cloud cluster (EKS, GKE, AKS), run `pulumi config set metallb false` first. The cloud provider will then hand out the LoadBalancer addresses, and you can skip `kind-config.yaml` and the localhost links.
 
 ## Clean up
 
-When you're done testing, remove the resources created by Pulumi and delete the kind cluster.
-
 ```bash
-pulumi destroy
-pulumi stack rm dev
+pulumi destroy --yes
+pulumi stack rm dev --yes
 kind delete cluster --name guestbook
 ```
-
-That's it. You now have a Kubernetes Guestbook application with Prometheus collecting metrics and Grafana displaying them on a dashboard.
