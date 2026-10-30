@@ -14,5 +14,5 @@
     "resolveJsonModule": true,
     "esModuleInterop": true
   },
-  "files": ["index.ts", "guestbook.ts", "monitoring.ts"]
+  "files": ["index.ts", "guestbook.ts", "monitoring.ts", "metallb.ts"]
 }
