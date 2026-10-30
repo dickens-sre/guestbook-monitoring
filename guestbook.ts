@@ -6,21 +6,22 @@ import * as pulumi from "@pulumi/pulumi";
 
 export interface GuestbookArgs {
     namespace: string;
-    isMinikube: boolean;
     frontendReplicas: number;
+    frontendNodePort: number;
     redisExporterImage: string;
     apacheExporterImage: string;
     trafficGenerator: boolean;
+    loadBalancerReady: pulumi.Resource[];  // metallb pool
+    prometheusReady: pulumi.Resource[];    // ServiceMonitor CRD comes from the helm chart
 }
 
 const METRICS_LABEL = { "monitoring.guestbook/scrape": "true" };
 
 export class Guestbook extends pulumi.ComponentResource {
-    public readonly frontendIp: pulumi.Output<string>;
+    public readonly frontendService: k8s.core.v1.Service;
     public readonly namespace: pulumi.Output<string>;
 
-    constructor(name: string, args: GuestbookArgs,
-                opts?: pulumi.ComponentResourceOptions & { monitoringReady?: pulumi.Resource[] }) {
+    constructor(name: string, args: GuestbookArgs, opts?: pulumi.ComponentResourceOptions) {
         super("guestbook:app:Guestbook", name, {}, opts);
         const parent = { parent: this };
 
@@ -28,7 +29,7 @@ export class Guestbook extends pulumi.ComponentResource {
         this.namespace = ns.metadata.name;
         const namespace = ns.metadata.name;
 
-        // redis_exporter sidecar, reads redis on localhost and serves metrics on 9121
+        // redis_exporter sidecar on 9121
         const redisExporter = (): k8s.types.input.core.v1.Container => ({
             name: "redis-exporter",
             image: args.redisExporterImage,
@@ -98,8 +99,7 @@ export class Guestbook extends pulumi.ComponentResource {
             },
         }, parent);
 
-        // frontend
-        // enable apache mod_status (localhost only) so the exporter can read request counts
+        // frontend: turn on apache mod_status (localhost only) for the apache exporter sidecar
         const apacheStatusConf = new k8s.core.v1.ConfigMap("frontend-apache-status", {
             metadata: { namespace },
             data: {
@@ -156,21 +156,16 @@ export class Guestbook extends pulumi.ComponentResource {
                 },
             },
         }, parent);
-        const frontendService = new k8s.core.v1.Service("frontend", {
+        this.frontendService = new k8s.core.v1.Service("frontend", {
             metadata: { name: "frontend", namespace, labels: frontendLabels },
             spec: {
-                type: args.isMinikube ? "ClusterIP" : "LoadBalancer",
-                ports: [{ name: "http", port: 80, targetPort: 80 }],
+                type: "LoadBalancer",
+                ports: [{ name: "http", port: 80, targetPort: 80, nodePort: args.frontendNodePort }],
                 selector: frontendDeployment.spec.template.metadata.labels,
             },
-        }, parent);
+        }, { parent: this, dependsOn: args.loadBalancerReady });
 
-        this.frontendIp = args.isMinikube
-            ? frontendService.spec.clusterIP
-            : frontendService.status.loadBalancer.ingress.apply(i => i?.[0]?.ip || i?.[0]?.hostname || "pending");
-
-        // separate ClusterIP services for the metrics ports, so metrics
-        // aren't exposed on the public frontend service
+        // metrics get their own ClusterIP services so they aren't on the public frontend service
         const tiers: Array<{ app: string; tier: string; port: number }> = [
             { app: "frontend", tier: "frontend", port: 9117 },
             { app: "redis-leader", tier: "backend", port: 9121 },
@@ -182,11 +177,6 @@ export class Guestbook extends pulumi.ComponentResource {
                     name: `${t.app}-metrics`,
                     namespace,
                     labels: { app: t.app, tier: t.tier, ...METRICS_LABEL },
-                    annotations: {
-                        "prometheus.io/scrape": "true",
-                        "prometheus.io/port": `${t.port}`,
-                        "prometheus.io/path": "/metrics",
-                    },
                 },
                 spec: {
                     type: "ClusterIP",
@@ -206,9 +196,9 @@ export class Guestbook extends pulumi.ComponentResource {
                 targetLabels: ["app", "tier"],
                 endpoints: [{ port: "metrics", path: "/metrics", interval: "15s" }],
             },
-        }, { parent: this, dependsOn: opts?.monitoringReady }); // CRD comes from the helm chart
+        }, { parent: this, dependsOn: args.prometheusReady });
 
-        // optional load so the dashboard has data
+        // small load generator so the dashboard has something to show
         if (args.trafficGenerator) {
             new k8s.apps.v1.Deployment("traffic-generator", {
                 metadata: { name: "traffic-generator", namespace },
@@ -237,6 +227,6 @@ export class Guestbook extends pulumi.ComponentResource {
             }, parent);
         }
 
-        this.registerOutputs({ frontendIp: this.frontendIp });
+        this.registerOutputs({});
     }
 }
