@@ -2,24 +2,26 @@ import * as fs from "fs";
 import * as path from "path";
 import * as k8s from "@pulumi/kubernetes";
 import * as pulumi from "@pulumi/pulumi";
-import * as random from "@pulumi/random";
 
 export interface MonitoringArgs {
     namespace: string;
-    grafanaServiceType: "LoadBalancer" | "NodePort" | "ClusterIP";
-    grafanaNodePort: number;
-    grafanaAdminUser: string;
-    grafanaAdminPassword?: pulumi.Input<string>;
     chartVersion: string;
     appNamespace: string;
+    grafanaAdminUser: string;
+    grafanaAdminPassword: string;
+    grafanaNodePort: number;
+    prometheusNodePort: number;
+}
+
+// External address of a LoadBalancer service (IP from MetalLB, hostname on some clouds).
+export function lbAddress(svc: k8s.core.v1.Service): pulumi.Output<string> {
+    return svc.status.loadBalancer.ingress.apply(i => i?.[0]?.ip || i?.[0]?.hostname || "pending");
 }
 
 export class Monitoring extends pulumi.ComponentResource {
     public readonly release: k8s.helm.v3.Release;
     public readonly grafanaUrl: pulumi.Output<string>;
-    public readonly grafanaAdminUser: pulumi.Output<string>;
-    public readonly grafanaAdminPassword: pulumi.Output<string>;
-    public readonly prometheusPortForward: pulumi.Output<string>;
+    public readonly prometheusUrl: pulumi.Output<string>;
 
     constructor(name: string, args: MonitoringArgs, opts?: pulumi.ComponentResourceOptions) {
         super("guestbook:monitoring:Monitoring", name, {}, opts);
@@ -27,19 +29,6 @@ export class Monitoring extends pulumi.ComponentResource {
         const ns = new k8s.core.v1.Namespace(name, {
             metadata: { name: args.namespace },
         }, { parent: this });
-
-        // use the configured password, or generate one
-        const adminPassword: pulumi.Output<string> = args.grafanaAdminPassword
-            ? pulumi.secret(pulumi.output(args.grafanaAdminPassword))
-            : new random.RandomPassword(`${name}-grafana-admin`, {
-                length: 20,
-                special: false,
-            }, { parent: this }).result;
-
-        const grafanaService: Record<string, unknown> = { type: args.grafanaServiceType, port: 80 };
-        if (args.grafanaServiceType === "NodePort") {
-            grafanaService.nodePort = args.grafanaNodePort;
-        }
 
         const releaseName = "kps";
 
@@ -57,8 +46,7 @@ export class Monitoring extends pulumi.ComponentResource {
                     prometheusSpec: {
                         scrapeInterval: "15s",
                         retention: "2d",
-                        // pick up ServiceMonitors from all namespaces, not only ones
-                        // labelled with this helm release
+                        // pick up ServiceMonitors from every namespace, not just ones labelled for this release
                         serviceMonitorSelectorNilUsesHelmValues: false,
                         podMonitorSelectorNilUsesHelmValues: false,
                         ruleSelectorNilUsesHelmValues: false,
@@ -66,8 +54,7 @@ export class Monitoring extends pulumi.ComponentResource {
                 },
                 grafana: {
                     adminUser: args.grafanaAdminUser,
-                    adminPassword: adminPassword,
-                    service: grafanaService,
+                    adminPassword: args.grafanaAdminPassword,
                     sidecar: {
                         dashboards: {
                             enabled: true,
@@ -80,7 +67,7 @@ export class Monitoring extends pulumi.ComponentResource {
                     },
                 },
             },
-        }, { parent: this });
+        }, { parent: this, dependsOn: opts?.dependsOn });
 
         // the grafana sidecar loads any ConfigMap with the grafana_dashboard label
         const dashboardJson = fs
@@ -97,37 +84,31 @@ export class Monitoring extends pulumi.ComponentResource {
             data: { "guestbook-dashboard.json": dashboardJson },
         }, { parent: this, dependsOn: [this.release] });
 
-        const grafanaSvc = k8s.core.v1.Service.get(
-            `${name}-grafana-svc`,
-            pulumi.interpolate`${this.release.status.namespace}/${this.release.status.name}-grafana`,
-            { parent: this, dependsOn: [this.release] },
-        );
+        // Our own LoadBalancer services so the node ports are fixed and match kind-config.yaml.
+        const grafanaLb = new k8s.core.v1.Service(`${name}-grafana-lb`, {
+            metadata: { name: "grafana-lb", namespace: ns.metadata.name },
+            spec: {
+                type: "LoadBalancer",
+                selector: { "app.kubernetes.io/name": "grafana", "app.kubernetes.io/instance": releaseName },
+                ports: [{ name: "http", port: 80, targetPort: 3000, nodePort: args.grafanaNodePort }],
+            },
+        }, { parent: this, dependsOn: [this.release] });
 
-        switch (args.grafanaServiceType) {
-            case "LoadBalancer":
-                this.grafanaUrl = grafanaSvc.status.apply(s => {
-                    const ing = s?.loadBalancer?.ingress?.[0];
-                    const host = ing?.ip || ing?.hostname;
-                    return host ? `http://${host}` : "pending";
-                });
-                break;
-            case "NodePort":
-                this.grafanaUrl = pulumi.interpolate`http://<node-ip>:${grafanaSvc.spec.ports[0].nodePort}`;
-                break;
-            default:
-                this.grafanaUrl = pulumi.output("http://localhost:3000 (via port-forward)");
-        }
+        const prometheusLb = new k8s.core.v1.Service(`${name}-prometheus-lb`, {
+            metadata: { name: "prometheus-lb", namespace: ns.metadata.name },
+            spec: {
+                type: "LoadBalancer",
+                selector: {
+                    "app.kubernetes.io/name": "prometheus",
+                    "operator.prometheus.io/name": `${releaseName}-prometheus`,
+                },
+                ports: [{ name: "http", port: 9090, targetPort: 9090, nodePort: args.prometheusNodePort }],
+            },
+        }, { parent: this, dependsOn: [this.release] });
 
-        this.grafanaAdminUser = pulumi.output(args.grafanaAdminUser);
-        this.grafanaAdminPassword = pulumi.secret(adminPassword);
-        this.prometheusPortForward = pulumi.output(
-            `kubectl -n ${args.namespace} port-forward svc/prometheus-operated 9090:9090`,
-        );
+        this.grafanaUrl = pulumi.interpolate`http://${lbAddress(grafanaLb)}`;
+        this.prometheusUrl = pulumi.interpolate`http://${lbAddress(prometheusLb)}:9090`;
 
-        this.registerOutputs({
-            grafanaUrl: this.grafanaUrl,
-            grafanaAdminUser: this.grafanaAdminUser,
-            grafanaAdminPassword: this.grafanaAdminPassword,
-        });
+        this.registerOutputs({ grafanaUrl: this.grafanaUrl, prometheusUrl: this.prometheusUrl });
     }
 }
